@@ -113,7 +113,10 @@ activity-report overview --since 2026-03-25 --until 2026-03-27 --skip-pulse
   `key_down_count > 0`, and it can also contribute foreground-only buckets such
   as reading in `Preview` or `Zotero`, plus microphone-backed dictation time.
 - Git commits and Slack messages contribute point events.
-- Nearby evidence is merged with `session_gap_min`.
+- Nearby evidence is merged with `session_gap_min`, which defaults to `15 min`.
+- Codex and Claude evidence is additionally split on `ai_max_event_gap_min`, which
+  also defaults to `15 min`, so long quiet stretches inside AI logs stop counting
+  as continuous work.
 - You can exclude obvious non-work apps via `[pulse].non_work_app_names` or
   `[pulse].non_work_bundle_ids` in the config.
 - If a merged session starts with a point event instead of an observed interval,

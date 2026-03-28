@@ -56,6 +56,7 @@ class ActivityReportTests(unittest.TestCase):
             ),
             analysis=AnalysisConfig(
                 session_gap_min=45.0,
+                ai_max_event_gap_min=15.0,
                 start_padding_mode="median-first",
                 start_padding_min=15.0,
             ),
@@ -230,6 +231,45 @@ class ActivityReportTests(unittest.TestCase):
             self.assertEqual([item.label for item in items], ["proj: One", "proj: Two", "proj: Three"])
             self.assertEqual(mock_check_output.call_count, 2)
 
+    def test_ai_event_gap_cap_splits_long_quiet_spans(self) -> None:
+        with TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            config = self._test_config(root)
+            day_root = config.paths.codex_home / "sessions" / "2026" / "03" / "28"
+            day_root.mkdir(parents=True)
+            session_file = day_root / "session.jsonl"
+            session_file.write_text(
+                "\n".join(
+                    [
+                        '{"timestamp":"2026-03-28T09:00:00+00:00"}',
+                        '{"timestamp":"2026-03-28T09:10:00+00:00"}',
+                        '{"timestamp":"2026-03-28T09:35:00+00:00"}',
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            items = collect_codex_intervals(
+                config,
+                config.paths.codex_home,
+                datetime(2026, 3, 28, 0, 0, tzinfo=UTC),
+                datetime(2026, 3, 29, 0, 0, tzinfo=UTC),
+                session_gap_min=45.0,
+                ai_max_event_gap_min=15.0,
+                use_cache=False,
+            )
+            merged = collect_codex_intervals(
+                config,
+                config.paths.codex_home,
+                datetime(2026, 3, 28, 0, 0, tzinfo=UTC),
+                datetime(2026, 3, 29, 0, 0, tzinfo=UTC),
+                session_gap_min=45.0,
+                ai_max_event_gap_min=30.0,
+                use_cache=False,
+            )
+            self.assertEqual(len(items), 2)
+            self.assertEqual(len(merged), 1)
+
     def test_codex_intervals_use_dated_paths_only(self) -> None:
         with TemporaryDirectory() as tmp_dir:
             root = Path(tmp_dir)
@@ -249,9 +289,13 @@ class ActivityReportTests(unittest.TestCase):
             seen_paths: list[Path] = []
             original = sources._read_jsonl_spans
 
-            def fake_read_jsonl_spans(path: Path, *, session_gap_min: float):
+            def fake_read_jsonl_spans(path: Path, *, session_gap_min: float, ai_max_event_gap_min: float):
                 seen_paths.append(path)
-                return original(path, session_gap_min=session_gap_min)
+                return original(
+                    path,
+                    session_gap_min=session_gap_min,
+                    ai_max_event_gap_min=ai_max_event_gap_min,
+                )
 
             with patch("activity_report.sources._read_jsonl_spans", side_effect=fake_read_jsonl_spans):
                 items = collect_codex_intervals(
@@ -260,6 +304,7 @@ class ActivityReportTests(unittest.TestCase):
                     datetime(2026, 3, 28, 0, 0, tzinfo=UTC),
                     datetime(2026, 3, 29, 0, 0, tzinfo=UTC),
                     session_gap_min=45.0,
+                    ai_max_event_gap_min=15.0,
                 )
             self.assertEqual(len(items), 2)
             self.assertEqual(seen_paths, [previous_file, wanted_file])
@@ -288,6 +333,7 @@ class ActivityReportTests(unittest.TestCase):
                     datetime(2026, 3, 28, 0, 0, tzinfo=UTC),
                     datetime(2026, 3, 29, 0, 0, tzinfo=UTC),
                     session_gap_min=45.0,
+                    ai_max_event_gap_min=15.0,
                 )
                 second = collect_codex_intervals(
                     config,
@@ -295,6 +341,7 @@ class ActivityReportTests(unittest.TestCase):
                     datetime(2026, 3, 28, 0, 0, tzinfo=UTC),
                     datetime(2026, 3, 29, 0, 0, tzinfo=UTC),
                     session_gap_min=45.0,
+                    ai_max_event_gap_min=15.0,
                 )
             self.assertEqual(len(first), 1)
             self.assertEqual(len(second), 1)

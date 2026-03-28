@@ -54,6 +54,11 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     overview.add_argument("--session-gap-min", type=float, help="Gap threshold in minutes")
     overview.add_argument(
+        "--ai-max-event-gap-min",
+        type=float,
+        help="Maximum gap between Codex/Claude events before treating it as a pause",
+    )
+    overview.add_argument(
         "--start-padding-mode",
         choices=("median-first", "mean-first", "fixed", "none"),
         help="How to estimate missing work before a point-start session",
@@ -93,6 +98,11 @@ def _cmd_overview(args: argparse.Namespace) -> int:
         since,
         until,
         session_gap_min=options.session_gap_min,
+        ai_max_event_gap_min=(
+            args.ai_max_event_gap_min
+            if args.ai_max_event_gap_min is not None
+            else config.analysis.ai_max_event_gap_min
+        ),
         include_pulse=not args.skip_pulse,
         include_git=not args.skip_git,
         include_codex=not args.skip_codex,

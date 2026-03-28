@@ -19,6 +19,7 @@ This repo estimates likely work time from local evidence. The right setup is use
 8. Ask before enabling Slack and before writing a persistent Slack query into the config.
 9. Run a narrow local test range first before doing full-history scans.
 10. Leave `[cache]` enabled unless the user explicitly wants live-only reruns; it prevents repeated Slack reads for past days and reuses parsed Codex/Claude session spans for unchanged JSONL files.
+11. The default calibration is conservative: `[analysis].session_gap_min = 15` and `[analysis].ai_max_event_gap_min = 15`, so gaps larger than 15 minutes are treated as pauses unless the user asks for a looser model.
 
 ## Privacy Boundaries
 

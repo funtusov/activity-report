@@ -50,6 +50,7 @@ class PulseConfig:
 @dataclass(frozen=True)
 class AnalysisConfig:
     session_gap_min: float
+    ai_max_event_gap_min: float
     start_padding_mode: str
     start_padding_min: float
 
@@ -182,7 +183,8 @@ def load_config(path: Path = DEFAULT_CONFIG_PATH) -> ActivityConfig:
             non_work_bundle_ids=_string_list(pulse.get("non_work_bundle_ids"), ()),
         ),
         analysis=AnalysisConfig(
-            session_gap_min=_float_value(analysis.get("session_gap_min"), 45.0),
+            session_gap_min=_float_value(analysis.get("session_gap_min"), 15.0),
+            ai_max_event_gap_min=_float_value(analysis.get("ai_max_event_gap_min"), 15.0),
             start_padding_mode=_string_or_none(analysis.get("start_padding_mode"))
             or "median-first",
             start_padding_min=_float_value(analysis.get("start_padding_min"), 15.0),
@@ -227,7 +229,8 @@ non_work_app_names = []
 non_work_bundle_ids = []
 
 [analysis]
-session_gap_min = 45
+session_gap_min = 15
+ai_max_event_gap_min = 15
 start_padding_mode = "median-first"
 start_padding_min = 15
 """

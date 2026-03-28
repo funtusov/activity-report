@@ -15,7 +15,7 @@ from activity_report.config import ActivityConfig
 from activity_report.models import EvidenceInterval
 
 
-CACHE_SCHEMA_VERSION = 2
+CACHE_SCHEMA_VERSION = 3
 
 
 def collect_all_evidence(
@@ -24,6 +24,7 @@ def collect_all_evidence(
     until: datetime,
     *,
     session_gap_min: float,
+    ai_max_event_gap_min: float,
     include_pulse: bool = True,
     include_git: bool = True,
     include_codex: bool = True,
@@ -56,6 +57,7 @@ def collect_all_evidence(
                 since,
                 until,
                 session_gap_min=session_gap_min,
+                ai_max_event_gap_min=ai_max_event_gap_min,
                 use_cache=use_cache and config.cache.enabled,
                 refresh_cache=refresh_cache,
             )
@@ -68,6 +70,7 @@ def collect_all_evidence(
                 since,
                 until,
                 session_gap_min=session_gap_min,
+                ai_max_event_gap_min=ai_max_event_gap_min,
                 use_cache=use_cache and config.cache.enabled,
                 refresh_cache=refresh_cache,
             )
@@ -269,6 +272,7 @@ def collect_codex_intervals(
     until: datetime,
     *,
     session_gap_min: float,
+    ai_max_event_gap_min: float,
     use_cache: bool = True,
     refresh_cache: bool = False,
 ) -> list[EvidenceInterval]:
@@ -283,6 +287,7 @@ def collect_codex_intervals(
         since=since,
         until=until,
         session_gap_min=session_gap_min,
+        ai_max_event_gap_min=ai_max_event_gap_min,
         cache_root=_session_cache_root(config),
         use_cache=use_cache,
         refresh_cache=refresh_cache,
@@ -296,6 +301,7 @@ def collect_claude_intervals(
     until: datetime,
     *,
     session_gap_min: float,
+    ai_max_event_gap_min: float,
     use_cache: bool = True,
     refresh_cache: bool = False,
 ) -> list[EvidenceInterval]:
@@ -309,6 +315,7 @@ def collect_claude_intervals(
         since=since,
         until=until,
         session_gap_min=session_gap_min,
+        ai_max_event_gap_min=ai_max_event_gap_min,
         cache_root=_session_cache_root(config),
         use_cache=use_cache,
         refresh_cache=refresh_cache,
@@ -322,6 +329,7 @@ def _collect_jsonl_session_intervals(
     since: datetime,
     until: datetime,
     session_gap_min: float,
+    ai_max_event_gap_min: float,
     cache_root: Path | None,
     use_cache: bool,
     refresh_cache: bool,
@@ -332,6 +340,7 @@ def _collect_jsonl_session_intervals(
             path,
             source=source,
             session_gap_min=session_gap_min,
+            ai_max_event_gap_min=ai_max_event_gap_min,
             cache_root=cache_root,
             use_cache=use_cache,
             refresh_cache=refresh_cache,
@@ -373,22 +382,43 @@ def _read_jsonl_spans_cached(
     *,
     source: str,
     session_gap_min: float,
+    ai_max_event_gap_min: float,
     cache_root: Path | None,
     use_cache: bool,
     refresh_cache: bool,
 ) -> tuple[str | None, list[tuple[datetime, datetime]]]:
     if not use_cache or cache_root is None:
-        return _read_jsonl_spans(path, session_gap_min=session_gap_min)
+        return _read_jsonl_spans(
+            path,
+            session_gap_min=session_gap_min,
+            ai_max_event_gap_min=ai_max_event_gap_min,
+        )
     cache_path = _session_cache_path(cache_root, source, path)
     stat = _safe_stat(path)
     if stat is None:
         return None, []
     if not refresh_cache:
-        cached = _read_session_span_cache(cache_path, stat, session_gap_min)
+        cached = _read_session_span_cache(
+            cache_path,
+            stat,
+            session_gap_min,
+            ai_max_event_gap_min,
+        )
         if cached is not None:
             return cached
-    label, spans = _read_jsonl_spans(path, session_gap_min=session_gap_min)
-    _write_session_span_cache(cache_path, stat, session_gap_min, label, spans)
+    label, spans = _read_jsonl_spans(
+        path,
+        session_gap_min=session_gap_min,
+        ai_max_event_gap_min=ai_max_event_gap_min,
+    )
+    _write_session_span_cache(
+        cache_path,
+        stat,
+        session_gap_min,
+        ai_max_event_gap_min,
+        label,
+        spans,
+    )
     return label, spans
 
 
@@ -396,6 +426,7 @@ def _read_jsonl_spans(
     path: Path,
     *,
     session_gap_min: float,
+    ai_max_event_gap_min: float,
 ) -> tuple[str | None, list[tuple[datetime, datetime]]]:
     timestamps: list[datetime] = []
     label: str | None = None
@@ -427,7 +458,10 @@ def _read_jsonl_spans(
     spans: list[tuple[datetime, datetime]] = []
     start = timestamps[0]
     end = timestamps[0]
-    gap_limit = timedelta(minutes=session_gap_min)
+    effective_gap_min = session_gap_min
+    if ai_max_event_gap_min > 0:
+        effective_gap_min = min(session_gap_min, ai_max_event_gap_min)
+    gap_limit = timedelta(minutes=effective_gap_min)
     for event_dt in timestamps[1:]:
         if event_dt - end > gap_limit:
             spans.append((start, end))
@@ -455,6 +489,7 @@ def _read_session_span_cache(
     cache_path: Path,
     stat: os.stat_result,
     session_gap_min: float,
+    ai_max_event_gap_min: float,
 ) -> tuple[str | None, list[tuple[datetime, datetime]]] | None:
     if not cache_path.exists():
         return None
@@ -469,6 +504,8 @@ def _read_session_span_cache(
     if payload.get("size") != stat.st_size or payload.get("mtime_ns") != stat.st_mtime_ns:
         return None
     if float(payload.get("session_gap_min", -1.0)) != float(session_gap_min):
+        return None
+    if float(payload.get("ai_max_event_gap_min", -1.0)) != float(ai_max_event_gap_min):
         return None
     raw_spans = payload.get("spans")
     if not isinstance(raw_spans, list):
@@ -489,6 +526,7 @@ def _write_session_span_cache(
     cache_path: Path,
     stat: os.stat_result,
     session_gap_min: float,
+    ai_max_event_gap_min: float,
     label: str | None,
     spans: list[tuple[datetime, datetime]],
 ) -> None:
@@ -497,6 +535,7 @@ def _write_session_span_cache(
         "size": stat.st_size,
         "mtime_ns": stat.st_mtime_ns,
         "session_gap_min": session_gap_min,
+        "ai_max_event_gap_min": ai_max_event_gap_min,
         "label": label,
         "spans": [
             {
