@@ -1,0 +1,17 @@
+#!/usr/bin/env sh
+set -eu
+
+SCRIPT_PATH="$0"
+while [ -L "$SCRIPT_PATH" ]; do
+  LINK_DIR=$(cd -P -- "$(dirname -- "$SCRIPT_PATH")" && pwd)
+  SCRIPT_PATH=$(readlink "$SCRIPT_PATH")
+  case "$SCRIPT_PATH" in
+    /*) ;;
+    *) SCRIPT_PATH="$LINK_DIR/$SCRIPT_PATH" ;;
+  esac
+done
+
+SCRIPT_DIR=$(cd -P -- "$(dirname -- "$SCRIPT_PATH")" && pwd)
+PROJECT_DIR="$SCRIPT_DIR/.."
+
+exec uv run --project "$PROJECT_DIR" activity-report "$@"
