@@ -55,12 +55,19 @@ class AnalysisConfig:
 
 
 @dataclass(frozen=True)
+class CacheConfig:
+    enabled: bool
+    cache_dir: Path
+
+
+@dataclass(frozen=True)
 class ActivityConfig:
     paths: PathsConfig
     git: GitConfig
     slack: SlackConfig
     pulse: PulseConfig
     analysis: AnalysisConfig
+    cache: CacheConfig
 
 
 def _load_toml(path: Path) -> dict[str, Any]:
@@ -126,6 +133,7 @@ def load_config(path: Path = DEFAULT_CONFIG_PATH) -> ActivityConfig:
     slack = data.get("slack") if isinstance(data.get("slack"), dict) else {}
     pulse = data.get("pulse") if isinstance(data.get("pulse"), dict) else {}
     analysis = data.get("analysis") if isinstance(data.get("analysis"), dict) else {}
+    cache = data.get("cache") if isinstance(data.get("cache"), dict) else {}
     return ActivityConfig(
         paths=PathsConfig(
             development_root=Path(
@@ -179,6 +187,12 @@ def load_config(path: Path = DEFAULT_CONFIG_PATH) -> ActivityConfig:
             or "median-first",
             start_padding_min=_float_value(analysis.get("start_padding_min"), 15.0),
         ),
+        cache=CacheConfig(
+            enabled=_bool_value(cache.get("enabled"), True),
+            cache_dir=Path(
+                _string_or_none(cache.get("cache_dir")) or "~/.cache/activity-report"
+            ).expanduser(),
+        ),
     )
 
 
@@ -200,6 +214,10 @@ enabled = false
 query = ""
 cli_path = "slack-mcp-cli"
 limit_per_day = 500
+
+[cache]
+enabled = true
+cache_dir = "~/.cache/activity-report"
 
 [pulse]
 enabled = true

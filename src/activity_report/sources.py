@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import csv
+import hashlib
 import io
 import json
 import os
@@ -12,6 +13,9 @@ from pathlib import Path
 
 from activity_report.config import ActivityConfig
 from activity_report.models import EvidenceInterval
+
+
+CACHE_SCHEMA_VERSION = 1
 
 
 def collect_all_evidence(
@@ -26,6 +30,8 @@ def collect_all_evidence(
     include_claude: bool = True,
     include_slack: bool = True,
     slack_query: str | None = None,
+    use_cache: bool = True,
+    refresh_cache: bool = False,
 ) -> list[EvidenceInterval]:
     items: list[EvidenceInterval] = []
     if include_pulse and config.pulse.enabled:
@@ -63,7 +69,16 @@ def collect_all_evidence(
     if include_slack:
         effective_query = slack_query or config.slack.query
         if effective_query and (config.slack.enabled or slack_query is not None):
-            items.extend(collect_slack_points(config, since, until, effective_query))
+            items.extend(
+                collect_slack_points(
+                    config,
+                    since,
+                    until,
+                    effective_query,
+                    use_cache=use_cache and config.cache.enabled,
+                    refresh_cache=refresh_cache,
+                )
+            )
     return items
 
 
@@ -141,8 +156,15 @@ def _read_activity_pulse_file(
                 if bundle_id and bundle_id.casefold() in skipped_bundle_ids:
                     continue
                 foreground_seconds = _float_or_none(payload.get("foreground_seconds")) or 0.0
+                microphone_active_seconds = (
+                    _float_or_none(payload.get("microphone_active_seconds")) or 0.0
+                )
                 bucket_seconds = max(0.0, (end - start).total_seconds())
-                observed_seconds = foreground_seconds if foreground_seconds > 0 else bucket_seconds
+                observed_seconds = max(
+                    foreground_seconds,
+                    microphone_active_seconds,
+                    bucket_seconds if foreground_seconds <= 0 and microphone_active_seconds <= 0 else 0.0,
+                )
                 if key_down_count <= 0:
                     if not include_foreground_without_keys or observed_seconds < min_foreground_seconds:
                         continue
@@ -352,15 +374,64 @@ def collect_slack_points(
     since: datetime,
     until: datetime,
     query: str,
+    *,
+    use_cache: bool = True,
+    refresh_cache: bool = False,
+) -> list[EvidenceInterval]:
+    if not use_cache:
+        return _collect_slack_points_live(config, since, until, query)
+    local_tz = since.tzinfo or datetime.now().astimezone().tzinfo
+    if local_tz is None:
+        return _collect_slack_points_live(config, since, until, query)
+    current_day = since.astimezone(local_tz).date()
+    last_day = (until - timedelta(seconds=1)).astimezone(local_tz).date()
+    today = _local_today(local_tz)
+    cache_key = _slack_cache_key(config, query, local_tz)
+    items: list[EvidenceInterval] = []
+    missing_past_days: list[date] = []
+    live_days: list[date] = []
+    while current_day <= last_day:
+        if current_day < today:
+            cached = None
+            if not refresh_cache:
+                cached = _read_slack_cache_day(config, cache_key, current_day)
+            if cached is None:
+                missing_past_days.append(current_day)
+            else:
+                items.extend(_clip_intervals(cached, since, until))
+        else:
+            live_days.append(current_day)
+        current_day += timedelta(days=1)
+    for start_day, end_day in _group_contiguous_days(missing_past_days):
+        range_start, range_end = _day_bounds(start_day, end_day, local_tz)
+        fresh_items = _collect_slack_points_live(config, range_start, range_end, query)
+        _write_slack_cache_days(config, cache_key, start_day, end_day, fresh_items, local_tz)
+        items.extend(_clip_intervals(fresh_items, since, until))
+    for start_day, end_day in _group_contiguous_days(live_days):
+        range_start, range_end = _day_bounds(start_day, end_day, local_tz)
+        items.extend(_clip_intervals(_collect_slack_points_live(config, range_start, range_end, query), since, until))
+    items.sort(key=lambda item: (item.start, item.end, item.label or ""))
+    return items
+
+
+def _collect_slack_points_live(
+    config: ActivityConfig,
+    since: datetime,
+    until: datetime,
+    query: str,
 ) -> list[EvidenceInterval]:
     items: list[EvidenceInterval] = []
-    day_after = since.astimezone().date().isoformat()
-    day_before = until.astimezone().date().isoformat()
-    search_query = f"{query} after:{day_after} before:{day_before}"
+    local_tz = since.tzinfo or datetime.now().astimezone().tzinfo
+    if local_tz is None:
+        return items
+    start_day = since.astimezone(local_tz).date()
+    end_day = until.astimezone(local_tz).date()
+    day_count = max((end_day - start_day).days, 1)
+    search_query = f"{query} after:{start_day.isoformat()} before:{end_day.isoformat()}"
     args = json.dumps(
         {
             "search_query": search_query,
-            "limit": config.slack.limit_per_day,
+            "limit": config.slack.limit_per_day * day_count,
         }
     )
     try:
@@ -389,6 +460,156 @@ def collect_slack_points(
             )
         )
     return items
+
+
+def _slack_cache_key(
+    config: ActivityConfig,
+    query: str,
+    local_tz: object,
+) -> str:
+    payload = {
+        "schema_version": CACHE_SCHEMA_VERSION,
+        "query": query,
+        "cli_path": config.slack.cli_path,
+        "limit_per_day": config.slack.limit_per_day,
+        "timezone": getattr(local_tz, "key", None) or str(local_tz),
+    }
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()[:16]
+
+
+def _slack_cache_path(config: ActivityConfig, cache_key: str, day: date) -> Path:
+    return config.cache.cache_dir / "slack" / cache_key / f"{day.isoformat()}.json"
+
+
+def _read_slack_cache_day(
+    config: ActivityConfig,
+    cache_key: str,
+    day: date,
+) -> list[EvidenceInterval] | None:
+    path = _slack_cache_path(config, cache_key, day)
+    if not path.exists():
+        return None
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    intervals = payload.get("intervals")
+    if not isinstance(intervals, list):
+        return None
+    items: list[EvidenceInterval] = []
+    for raw_item in intervals:
+        if not isinstance(raw_item, dict):
+            continue
+        start = parse_iso_datetime(str(raw_item.get("start", "")))
+        end = parse_iso_datetime(str(raw_item.get("end", "")))
+        if start is None or end is None or end < start:
+            continue
+        items.append(
+            EvidenceInterval(
+                source=str(raw_item.get("source") or "slack"),
+                start=start,
+                end=end,
+                label=_string_or_none(raw_item.get("label")),
+            )
+        )
+    return items
+
+
+def _write_slack_cache_days(
+    config: ActivityConfig,
+    cache_key: str,
+    start_day: date,
+    end_day: date,
+    items: list[EvidenceInterval],
+    local_tz: object,
+) -> None:
+    by_day: dict[date, list[EvidenceInterval]] = {}
+    for item in items:
+        item_day = item.start.astimezone(local_tz).date()
+        by_day.setdefault(item_day, []).append(item)
+    current_day = start_day
+    while current_day <= end_day:
+        path = _slack_cache_path(config, cache_key, current_day)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "schema_version": CACHE_SCHEMA_VERSION,
+            "source": "slack",
+            "day": current_day.isoformat(),
+            "cached_at": datetime.now().astimezone().isoformat(),
+            "intervals": [
+                {
+                    "source": item.source,
+                    "start": item.start.isoformat(),
+                    "end": item.end.isoformat(),
+                    "label": item.label,
+                }
+                for item in sorted(
+                    by_day.get(current_day, []),
+                    key=lambda interval: (interval.start, interval.end, interval.label or ""),
+                )
+            ],
+        }
+        temp_path = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+        try:
+            temp_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+            os.replace(temp_path, path)
+        except OSError:
+            try:
+                temp_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+        current_day += timedelta(days=1)
+
+
+def _group_contiguous_days(days: list[date]) -> list[tuple[date, date]]:
+    if not days:
+        return []
+    ordered = sorted(set(days))
+    groups: list[tuple[date, date]] = []
+    start_day = ordered[0]
+    end_day = ordered[0]
+    for current_day in ordered[1:]:
+        if current_day == end_day + timedelta(days=1):
+            end_day = current_day
+            continue
+        groups.append((start_day, end_day))
+        start_day = current_day
+        end_day = current_day
+    groups.append((start_day, end_day))
+    return groups
+
+
+def _day_bounds(start_day: date, end_day: date, local_tz: object) -> tuple[datetime, datetime]:
+    start = datetime.combine(start_day, time.min, tzinfo=local_tz)
+    end = datetime.combine(end_day + timedelta(days=1), time.min, tzinfo=local_tz)
+    return start, end
+
+
+def _clip_intervals(
+    items: list[EvidenceInterval],
+    since: datetime,
+    until: datetime,
+) -> list[EvidenceInterval]:
+    clipped: list[EvidenceInterval] = []
+    for item in items:
+        if item.end < since or item.start >= until:
+            continue
+        clipped.append(
+            EvidenceInterval(
+                source=item.source,
+                start=max(item.start, since),
+                end=min(item.end, until),
+                label=item.label,
+            )
+        )
+    return clipped
+
+
+def _local_today(local_tz: object) -> date:
+    return datetime.now(tz=local_tz).date()
 
 
 def _parse_slack_search_rows(raw_output: str) -> list[dict[str, str]]:

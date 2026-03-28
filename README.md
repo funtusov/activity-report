@@ -11,6 +11,17 @@ Estimate work activity from local evidence sources:
 The tool fuses those sources into work sessions, prints daily totals, and can
 show session-level detail.
 
+## Agent Setup
+
+If an AI agent is setting this up for the current user, it should read
+[`AGENTS.md`](./AGENTS.md) first. The important part is that config must be
+personalized rather than guessed:
+
+- derive git author defaults from the current user's global git config
+- ask which evidence sources to include
+- ask before enabling Slack and before saving a Slack query
+- ask which non-work apps should be excluded
+
 ## Quick Install
 
 For humans and agents:
@@ -49,6 +60,10 @@ back to `git config --global user.name` and `git config --global user.email`.
 Slack is disabled by default. Enable it only if you want Slack evidence in the
 estimate.
 
+Past-day Slack results are cached under `~/.cache/activity-report` by default,
+so rerunning historical reports does not keep hitting the Slack API. The cache
+is keyed by the Slack query and config, and the current day stays live.
+
 ## Usage
 
 Overview for a date range:
@@ -73,6 +88,13 @@ activity-report overview \
   --slack-query "from:your.handle"
 ```
 
+Bypass or rebuild caches for one run:
+
+```bash
+activity-report overview --since 2026-03-25 --until 2026-03-27 --no-cache
+activity-report overview --since 2026-03-25 --until 2026-03-27 --refresh-cache
+```
+
 Skip pulse buckets for one run:
 
 ```bash
@@ -85,7 +107,7 @@ activity-report overview --since 2026-03-25 --until 2026-03-27 --skip-pulse
   each local session file on idle gaps.
 - `activity-pulse` contributes observed per-bucket intervals whenever
   `key_down_count > 0`, and it can also contribute foreground-only buckets such
-  as reading in `Preview` or `Zotero`.
+  as reading in `Preview` or `Zotero`, plus microphone-backed dictation time.
 - Git commits and Slack messages contribute point events.
 - Nearby evidence is merged with `session_gap_min`.
 - You can exclude obvious non-work apps via `[pulse].non_work_app_names` or

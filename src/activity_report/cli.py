@@ -42,6 +42,16 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Show merged session detail",
     )
     overview.add_argument("--slack-query", help="Override Slack query for this run")
+    overview.add_argument(
+        "--no-cache",
+        action="store_true",
+        help="Disable evidence caches for this run",
+    )
+    overview.add_argument(
+        "--refresh-cache",
+        action="store_true",
+        help="Rebuild past-day caches instead of reusing them",
+    )
     overview.add_argument("--session-gap-min", type=float, help="Gap threshold in minutes")
     overview.add_argument(
         "--start-padding-mode",
@@ -89,6 +99,8 @@ def _cmd_overview(args: argparse.Namespace) -> int:
         include_claude=not args.skip_claude,
         include_slack=not args.skip_slack,
         slack_query=args.slack_query,
+        use_cache=not args.no_cache,
+        refresh_cache=args.refresh_cache,
     )
     report = build_report(items, since, until, options)
     if args.json:
