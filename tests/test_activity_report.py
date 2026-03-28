@@ -170,6 +170,66 @@ class ActivityReportTests(unittest.TestCase):
                     self.assertEqual(second[0].label, "proj: Standup update")
                     self.assertTrue(any(config.cache.cache_dir.rglob("2026-03-25.json")))
 
+    def test_slack_points_paginate(self) -> None:
+        with TemporaryDirectory() as tmp_dir:
+            config = self._test_config(Path(tmp_dir))
+            config = ActivityConfig(
+                paths=config.paths,
+                git=config.git,
+                slack=SlackConfig(
+                    enabled=True,
+                    query="from:test.user",
+                    cli_path="slack-mcp-cli",
+                    limit_per_day=200,
+                ),
+                pulse=config.pulse,
+                analysis=config.analysis,
+                cache=config.cache,
+            )
+            since = datetime(2026, 3, 25, 0, 0, tzinfo=UTC)
+            until = datetime(2026, 3, 26, 0, 0, tzinfo=UTC)
+            page_one = json.dumps(
+                {
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": (
+                                "MsgID,Channel,Text,Time,Cursor\n"
+                                "1,proj,One,2026-03-25T09:15:00+00:00,cGFnZToy\n"
+                                "2,proj,Two,2026-03-25T09:20:00+00:00,cGFnZToy\n"
+                            ),
+                        }
+                    ]
+                }
+            )
+            page_two = json.dumps(
+                {
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": (
+                                "MsgID,Channel,Text,Time,Cursor\n"
+                                "3,proj,Three,2026-03-25T09:25:00+00:00,\n"
+                            ),
+                        }
+                    ]
+                }
+            )
+            with patch(
+                "activity_report.sources.subprocess.check_output",
+                side_effect=[page_one, page_two],
+            ) as mock_check_output:
+                items = collect_slack_points(
+                    config,
+                    since,
+                    until,
+                    "from:test.user",
+                    use_cache=False,
+                )
+            self.assertEqual(len(items), 3)
+            self.assertEqual([item.label for item in items], ["proj: One", "proj: Two", "proj: Three"])
+            self.assertEqual(mock_check_output.call_count, 2)
+
     def test_codex_intervals_use_dated_paths_only(self) -> None:
         with TemporaryDirectory() as tmp_dir:
             root = Path(tmp_dir)

@@ -15,7 +15,7 @@ from activity_report.config import ActivityConfig
 from activity_report.models import EvidenceInterval
 
 
-CACHE_SCHEMA_VERSION = 1
+CACHE_SCHEMA_VERSION = 2
 
 
 def collect_all_evidence(
@@ -576,38 +576,67 @@ def _collect_slack_points_live(
     start_day = since.astimezone(local_tz).date()
     end_day = until.astimezone(local_tz).date()
     day_count = max((end_day - start_day).days, 1)
-    search_query = f"{query} after:{start_day.isoformat()} before:{end_day.isoformat()}"
-    args = json.dumps(
-        {
-            "search_query": search_query,
-            "limit": config.slack.limit_per_day * day_count,
+    total_limit = max(1, config.slack.limit_per_day * day_count)
+    page_limit = min(100, total_limit)
+    seen_rows: set[tuple[str, str, str]] = set()
+    cursor = ""
+    while len(items) < total_limit:
+        args_payload: dict[str, object] = {
+            "search_query": query,
+            "filter_date_after": start_day.isoformat(),
+            "filter_date_before": end_day.isoformat(),
+            "limit": min(page_limit, total_limit - len(items)),
         }
-    )
-    try:
-        output = subprocess.check_output(
-            [config.slack.cli_path, "call", "conversations_search_messages", "--args", args],
-            text=True,
-            stderr=subprocess.DEVNULL,
-        )
-    except (OSError, subprocess.CalledProcessError):
-        return items
-    for row in _parse_slack_search_rows(output):
-        event_dt = parse_iso_datetime(row.get("Time", ""))
-        if event_dt is None or not (since <= event_dt < until):
-            continue
-        channel = row.get("Channel", "").strip()
-        text = " ".join(row.get("Text", "").split())
-        label = channel
-        if text:
-            label = f"{channel}: {text[:80]}" if channel else text[:80]
-        items.append(
-            EvidenceInterval(
-                source="slack",
-                start=event_dt,
-                end=event_dt,
-                label=label or "slack message",
+        if cursor:
+            args_payload["cursor"] = cursor
+        args = json.dumps(args_payload)
+        try:
+            output = subprocess.check_output(
+                [config.slack.cli_path, "call", "conversations_search_messages", "--args", args],
+                text=True,
+                stderr=subprocess.DEVNULL,
             )
-        )
+        except (OSError, subprocess.CalledProcessError):
+            return items
+        rows = _parse_slack_search_rows(output)
+        if not rows:
+            break
+        next_cursor = ""
+        added_this_page = 0
+        for row in rows:
+            row_cursor = row.get("Cursor", "").strip()
+            if row_cursor:
+                next_cursor = row_cursor
+            event_dt = parse_iso_datetime(row.get("Time", ""))
+            if event_dt is None or not (since <= event_dt < until):
+                continue
+            key = (
+                row.get("MsgID", "").strip(),
+                row.get("Channel", "").strip(),
+                row.get("Time", "").strip(),
+            )
+            if key in seen_rows:
+                continue
+            seen_rows.add(key)
+            channel = row.get("Channel", "").strip()
+            text = " ".join(row.get("Text", "").split())
+            label = channel
+            if text:
+                label = f"{channel}: {text[:80]}" if channel else text[:80]
+            items.append(
+                EvidenceInterval(
+                    source="slack",
+                    start=event_dt,
+                    end=event_dt,
+                    label=label or "slack message",
+                )
+            )
+            added_this_page += 1
+            if len(items) >= total_limit:
+                break
+        if not next_cursor or added_this_page == 0:
+            break
+        cursor = next_cursor
     return items
 
 
