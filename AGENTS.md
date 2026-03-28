@@ -18,14 +18,14 @@ This repo estimates likely work time from local evidence. The right setup is use
 7. Ask the user which obvious non-work apps should be excluded from pulse-derived evidence.
 8. Ask before enabling Slack and before writing a persistent Slack query into the config.
 9. Run a narrow local test range first before doing full-history scans.
-10. Leave `[cache]` enabled unless the user explicitly wants live-only reruns; it prevents repeated Slack reads for past days.
+10. Leave `[cache]` enabled unless the user explicitly wants live-only reruns; it prevents repeated Slack reads for past days and reuses parsed Codex/Claude session spans for unchanged JSONL files.
 
 ## Privacy Boundaries
 
 - Do not commit or document personal email addresses, Slack handles, access tokens, or private repo paths as defaults.
 - Keep the sample config generic.
 - If Slack is enabled, prefer user-approved explicit queries over guessed queries.
-- Cached Slack evidence for past days lives under `~/.cache/activity-report` by default. Use `--refresh-cache` after intentionally changing a persistent Slack query or other cache inputs.
+- Cached Slack evidence for past days lives under `~/.cache/activity-report` by default. The same cache root also stores parsed Codex/Claude session spans for unchanged JSONL files. Use `--refresh-cache` after intentionally changing a persistent Slack query or other cache inputs.
 
 ## Local Verification
 

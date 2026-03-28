@@ -9,6 +9,7 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
+import activity_report.sources as sources
 from activity_report.analysis import build_report
 from activity_report.config import (
     ActivityConfig,
@@ -20,13 +21,50 @@ from activity_report.config import (
     SlackConfig,
 )
 from activity_report.models import EvidenceInterval, OverviewOptions
-from activity_report.sources import collect_activity_pulse_intervals, collect_slack_points
+from activity_report.sources import (
+    collect_activity_pulse_intervals,
+    collect_codex_intervals,
+    collect_slack_points,
+)
 
 
 UTC = timezone.utc
 
 
 class ActivityReportTests(unittest.TestCase):
+    def _test_config(self, root: Path) -> ActivityConfig:
+        return ActivityConfig(
+            paths=PathsConfig(
+                development_root=root,
+                codex_home=root / ".codex",
+                claude_home=root / ".claude",
+                activity_pulse_home=root / "pulse",
+            ),
+            git=GitConfig(author_names=(), author_emails=(), repo_search_depth=1),
+            slack=SlackConfig(
+                enabled=True,
+                query="from:test.user",
+                cli_path="slack-mcp-cli",
+                limit_per_day=50,
+            ),
+            pulse=PulseConfig(
+                enabled=False,
+                include_foreground_without_keys=True,
+                min_foreground_seconds=20.0,
+                non_work_app_names=(),
+                non_work_bundle_ids=(),
+            ),
+            analysis=AnalysisConfig(
+                session_gap_min=45.0,
+                start_padding_mode="median-first",
+                start_padding_min=15.0,
+            ),
+            cache=CacheConfig(
+                enabled=True,
+                cache_dir=root / "cache",
+            ),
+        )
+
     def test_point_start_session_uses_median_first_gap_padding(self) -> None:
         items = [
             EvidenceInterval("git", datetime(2026, 3, 25, 9, 0, tzinfo=UTC), datetime(2026, 3, 25, 9, 0, tzinfo=UTC), "commit-a"),
@@ -102,37 +140,7 @@ class ActivityReportTests(unittest.TestCase):
 
     def test_slack_points_cache_past_days(self) -> None:
         with TemporaryDirectory() as tmp_dir:
-            config = ActivityConfig(
-                paths=PathsConfig(
-                    development_root=Path(tmp_dir),
-                    codex_home=Path(tmp_dir),
-                    claude_home=Path(tmp_dir),
-                    activity_pulse_home=Path(tmp_dir),
-                ),
-                git=GitConfig(author_names=(), author_emails=(), repo_search_depth=1),
-                slack=SlackConfig(
-                    enabled=True,
-                    query="from:test.user",
-                    cli_path="slack-mcp-cli",
-                    limit_per_day=50,
-                ),
-                pulse=PulseConfig(
-                    enabled=False,
-                    include_foreground_without_keys=True,
-                    min_foreground_seconds=20.0,
-                    non_work_app_names=(),
-                    non_work_bundle_ids=(),
-                ),
-                analysis=AnalysisConfig(
-                    session_gap_min=45.0,
-                    start_padding_mode="median-first",
-                    start_padding_min=15.0,
-                ),
-                cache=CacheConfig(
-                    enabled=True,
-                    cache_dir=Path(tmp_dir) / "cache",
-                ),
-            )
+            config = self._test_config(Path(tmp_dir))
             since = datetime(2026, 3, 25, 0, 0, tzinfo=UTC)
             until = datetime(2026, 3, 26, 0, 0, tzinfo=UTC)
             slack_output = json.dumps(
@@ -161,6 +169,76 @@ class ActivityReportTests(unittest.TestCase):
                     self.assertEqual(first[0].label, "proj: Standup update")
                     self.assertEqual(second[0].label, "proj: Standup update")
                     self.assertTrue(any(config.cache.cache_dir.rglob("2026-03-25.json")))
+
+    def test_codex_intervals_use_dated_paths_only(self) -> None:
+        with TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            config = self._test_config(root)
+            wanted = config.paths.codex_home / "sessions" / "2026" / "03" / "28"
+            previous = config.paths.codex_home / "sessions" / "2026" / "03" / "27"
+            ignored = config.paths.codex_home / "sessions" / "2026" / "03" / "26"
+            wanted.mkdir(parents=True)
+            previous.mkdir(parents=True)
+            ignored.mkdir(parents=True)
+            wanted_file = wanted / "wanted.jsonl"
+            previous_file = previous / "previous.jsonl"
+            ignored_file = ignored / "ignored.jsonl"
+            wanted_file.write_text('{"timestamp":"2026-03-28T09:00:00+00:00"}\n', encoding="utf-8")
+            previous_file.write_text('{"timestamp":"2026-03-28T00:05:00+00:00"}\n', encoding="utf-8")
+            ignored_file.write_text('{"timestamp":"2026-03-27T09:00:00+00:00"}\n', encoding="utf-8")
+            seen_paths: list[Path] = []
+            original = sources._read_jsonl_spans
+
+            def fake_read_jsonl_spans(path: Path, *, session_gap_min: float):
+                seen_paths.append(path)
+                return original(path, session_gap_min=session_gap_min)
+
+            with patch("activity_report.sources._read_jsonl_spans", side_effect=fake_read_jsonl_spans):
+                items = collect_codex_intervals(
+                    config,
+                    config.paths.codex_home,
+                    datetime(2026, 3, 28, 0, 0, tzinfo=UTC),
+                    datetime(2026, 3, 29, 0, 0, tzinfo=UTC),
+                    session_gap_min=45.0,
+                )
+            self.assertEqual(len(items), 2)
+            self.assertEqual(seen_paths, [previous_file, wanted_file])
+
+    def test_codex_interval_cache_reuses_cached_spans(self) -> None:
+        with TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            config = self._test_config(root)
+            day_root = config.paths.codex_home / "sessions" / "2026" / "03" / "28"
+            day_root.mkdir(parents=True)
+            session_file = day_root / "session.jsonl"
+            session_file.write_text(
+                "\n".join(
+                    [
+                        '{"timestamp":"2026-03-28T09:00:00+00:00"}',
+                        '{"timestamp":"2026-03-28T09:15:00+00:00"}',
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            with patch("activity_report.sources._read_jsonl_spans", wraps=sources._read_jsonl_spans) as wrapped:
+                first = collect_codex_intervals(
+                    config,
+                    config.paths.codex_home,
+                    datetime(2026, 3, 28, 0, 0, tzinfo=UTC),
+                    datetime(2026, 3, 29, 0, 0, tzinfo=UTC),
+                    session_gap_min=45.0,
+                )
+                second = collect_codex_intervals(
+                    config,
+                    config.paths.codex_home,
+                    datetime(2026, 3, 28, 0, 0, tzinfo=UTC),
+                    datetime(2026, 3, 29, 0, 0, tzinfo=UTC),
+                    session_gap_min=45.0,
+                )
+            self.assertEqual(len(first), 1)
+            self.assertEqual(len(second), 1)
+            self.assertEqual(wrapped.call_count, 1)
 
 
 if __name__ == "__main__":

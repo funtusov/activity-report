@@ -51,19 +51,25 @@ def collect_all_evidence(
     if include_codex:
         items.extend(
             collect_codex_intervals(
+                config,
                 config.paths.codex_home,
                 since,
                 until,
                 session_gap_min=session_gap_min,
+                use_cache=use_cache and config.cache.enabled,
+                refresh_cache=refresh_cache,
             )
         )
     if include_claude:
         items.extend(
             collect_claude_intervals(
+                config,
                 config.paths.claude_home,
                 since,
                 until,
                 session_gap_min=session_gap_min,
+                use_cache=use_cache and config.cache.enabled,
+                refresh_cache=refresh_cache,
             )
         )
     if include_slack:
@@ -257,32 +263,41 @@ def discover_git_repos(root: Path, max_depth: int) -> list[Path]:
 
 
 def collect_codex_intervals(
+    config: ActivityConfig,
     codex_home: Path,
     since: datetime,
     until: datetime,
     *,
     session_gap_min: float,
+    use_cache: bool = True,
+    refresh_cache: bool = False,
 ) -> list[EvidenceInterval]:
     candidates = []
     for subdir in ("archived_sessions", "sessions"):
         root = codex_home.expanduser() / subdir
         if root.exists():
-            candidates.extend(root.rglob("*.jsonl"))
+            candidates.extend(_codex_candidate_paths(root, since, until))
     return _collect_jsonl_session_intervals(
         candidates,
         source="codex",
         since=since,
         until=until,
         session_gap_min=session_gap_min,
+        cache_root=_session_cache_root(config),
+        use_cache=use_cache,
+        refresh_cache=refresh_cache,
     )
 
 
 def collect_claude_intervals(
+    config: ActivityConfig,
     claude_home: Path,
     since: datetime,
     until: datetime,
     *,
     session_gap_min: float,
+    use_cache: bool = True,
+    refresh_cache: bool = False,
 ) -> list[EvidenceInterval]:
     root = claude_home.expanduser() / "projects"
     if not root.exists():
@@ -294,6 +309,9 @@ def collect_claude_intervals(
         since=since,
         until=until,
         session_gap_min=session_gap_min,
+        cache_root=_session_cache_root(config),
+        use_cache=use_cache,
+        refresh_cache=refresh_cache,
     )
 
 
@@ -304,10 +322,20 @@ def _collect_jsonl_session_intervals(
     since: datetime,
     until: datetime,
     session_gap_min: float,
+    cache_root: Path | None,
+    use_cache: bool,
+    refresh_cache: bool,
 ) -> list[EvidenceInterval]:
     sessions: dict[str, EvidenceInterval] = {}
     for path in sorted(set(paths)):
-        label, spans = _read_jsonl_spans(path, session_gap_min=session_gap_min)
+        label, spans = _read_jsonl_spans_cached(
+            path,
+            source=source,
+            session_gap_min=session_gap_min,
+            cache_root=cache_root,
+            use_cache=use_cache,
+            refresh_cache=refresh_cache,
+        )
         for index, (start, end) in enumerate(spans):
             if end < since or start >= until:
                 continue
@@ -320,6 +348,48 @@ def _collect_jsonl_session_intervals(
             key = f"{path.name}:{index}"
             sessions[key] = interval
     return list(sorted(sessions.values(), key=lambda item: (item.start, item.end, item.label or "")))
+
+
+def _codex_candidate_paths(root: Path, since: datetime, until: datetime) -> list[Path]:
+    dated_candidates: list[Path] = []
+    current_day = since.astimezone().date() - timedelta(days=1)
+    last_day = (until - timedelta(seconds=1)).astimezone().date()
+    while current_day <= last_day:
+        day_root = root / f"{current_day.year:04d}" / f"{current_day.month:02d}" / f"{current_day.day:02d}"
+        if day_root.exists():
+            dated_candidates.extend(day_root.rglob("*.jsonl"))
+        current_day += timedelta(days=1)
+    if dated_candidates:
+        return dated_candidates
+    return list(root.rglob("*.jsonl"))
+
+
+def _session_cache_root(config: ActivityConfig) -> Path:
+    return config.cache.cache_dir / "session-spans"
+
+
+def _read_jsonl_spans_cached(
+    path: Path,
+    *,
+    source: str,
+    session_gap_min: float,
+    cache_root: Path | None,
+    use_cache: bool,
+    refresh_cache: bool,
+) -> tuple[str | None, list[tuple[datetime, datetime]]]:
+    if not use_cache or cache_root is None:
+        return _read_jsonl_spans(path, session_gap_min=session_gap_min)
+    cache_path = _session_cache_path(cache_root, source, path)
+    stat = _safe_stat(path)
+    if stat is None:
+        return None, []
+    if not refresh_cache:
+        cached = _read_session_span_cache(cache_path, stat, session_gap_min)
+        if cached is not None:
+            return cached
+    label, spans = _read_jsonl_spans(path, session_gap_min=session_gap_min)
+    _write_session_span_cache(cache_path, stat, session_gap_min, label, spans)
+    return label, spans
 
 
 def _read_jsonl_spans(
@@ -367,6 +437,85 @@ def _read_jsonl_spans(
         end = event_dt
     spans.append((start, end))
     return label, spans
+
+
+def _safe_stat(path: Path) -> os.stat_result | None:
+    try:
+        return path.stat()
+    except OSError:
+        return None
+
+
+def _session_cache_path(cache_root: Path, source: str, path: Path) -> Path:
+    digest = hashlib.sha256(str(path).encode("utf-8")).hexdigest()
+    return cache_root / source / digest[:2] / f"{digest}.json"
+
+
+def _read_session_span_cache(
+    cache_path: Path,
+    stat: os.stat_result,
+    session_gap_min: float,
+) -> tuple[str | None, list[tuple[datetime, datetime]]] | None:
+    if not cache_path.exists():
+        return None
+    try:
+        payload = json.loads(cache_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    if payload.get("schema_version") != CACHE_SCHEMA_VERSION:
+        return None
+    if payload.get("size") != stat.st_size or payload.get("mtime_ns") != stat.st_mtime_ns:
+        return None
+    if float(payload.get("session_gap_min", -1.0)) != float(session_gap_min):
+        return None
+    raw_spans = payload.get("spans")
+    if not isinstance(raw_spans, list):
+        return None
+    spans: list[tuple[datetime, datetime]] = []
+    for raw_span in raw_spans:
+        if not isinstance(raw_span, dict):
+            continue
+        start = parse_iso_datetime(str(raw_span.get("start", "")))
+        end = parse_iso_datetime(str(raw_span.get("end", "")))
+        if start is None or end is None or end < start:
+            continue
+        spans.append((start, end))
+    return _string_or_none(payload.get("label")), spans
+
+
+def _write_session_span_cache(
+    cache_path: Path,
+    stat: os.stat_result,
+    session_gap_min: float,
+    label: str | None,
+    spans: list[tuple[datetime, datetime]],
+) -> None:
+    payload = {
+        "schema_version": CACHE_SCHEMA_VERSION,
+        "size": stat.st_size,
+        "mtime_ns": stat.st_mtime_ns,
+        "session_gap_min": session_gap_min,
+        "label": label,
+        "spans": [
+            {
+                "start": start.isoformat(),
+                "end": end.isoformat(),
+            }
+            for start, end in spans
+        ],
+    }
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    temp_path = cache_path.with_name(f".{cache_path.name}.{os.getpid()}.tmp")
+    try:
+        temp_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        os.replace(temp_path, cache_path)
+    except OSError:
+        try:
+            temp_path.unlink(missing_ok=True)
+        except OSError:
+            pass
 
 
 def collect_slack_points(

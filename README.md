@@ -64,6 +64,10 @@ Past-day Slack results are cached under `~/.cache/activity-report` by default,
 so rerunning historical reports does not keep hitting the Slack API. The cache
 is keyed by the Slack query and config, and the current day stays live.
 
+Codex and Claude JSONL session logs also use a file-span cache under the same
+cache root. Unchanged session files are parsed once and then reused across
+reruns, which cuts repeated full-history scans substantially.
+
 ## Usage
 
 Overview for a date range:
